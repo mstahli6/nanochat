@@ -1,13 +1,19 @@
-.venv/
+# Model Weights & Checkpoints
+*.pt
+*.pth
+*.bin
+*_checkpoints/
+
+# Hardware/Systems "Noise"
+rustbpe/target/
 __pycache__/
-*.pyc
-dev-ignore/
-report.md
-eval_bundle/
+.DS_Store
 
-# Secrets
-.env
-
-# Local setup
-CLAUDE.md
+# Logs & Experiments
 wandb/
+*.log*.pt
+*.pth
+rustbpe/target/
+__pycache__/
+.DS_Store
+experiment_output.log
