@@ -20,7 +20,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW, SoapAdamW
+
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -366,7 +367,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, matrix_optim="muon"):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -395,12 +396,35 @@ class GPT(nn.Module):
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
+        # Matrix parameter groups (dynamic routing based on matrix_optim argument)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+            
+            if matrix_optim == "soap":
+                param_groups.append(dict(
+                    kind='soap', params=group_params, lr=matrix_lr,
+                    weight_decay=weight_decay,
+                    precondition_frequency=10,
+                    max_precond_dim=10000,
+                ))
+            else: # Default to Muon
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
+
+        # Optimizer Instantiation based on requested type
+        if matrix_optim == "soap":
+            if world_size > 1:
+                raise NotImplementedError("Distributed SOAP is not yet implemented. Please use a single GPU.")
+            optimizer = SoapAdamW(param_groups)
+        else: # Default to Muon
+            Factory = DistMuonAdamW if ddp else MuonAdamW
+            optimizer = Factory(param_groups)
+            
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)

@@ -10,6 +10,7 @@ Further contributions from @karpathy and @chrisjmccormick.
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from .soap import SOAP
 
 # -----------------------------------------------------------------------------
 """
@@ -531,3 +532,167 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+    # -----------------------------------------------------------------------------
+# Single GPU version of the SOAP + AdamW optimizer.
+
+class SoapAdamW(SOAP):
+    """
+    Combined optimizer: SOAP for 2D matrix params, AdamW for others.
+    Inherits from SOAP to gain access to the preconditioner helper methods.
+    """
+    def __init__(self, param_groups: list[dict]):
+        # Initialize the base PyTorch Optimizer to manage state, bypassing SOAP's defaults
+        # since we will handle parameter-specific logic dynamically in the step function.
+        torch.optim.Optimizer.__init__(self, param_groups, defaults={})
+        self._data_format = "channels_first"
+        
+        # 0-D CPU tensors for AdamW to avoid torch.compile recompilation
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    def _step_adamw(self, group: dict) -> None:
+        """
+        AdamW update. Exactly identical to MuonAdamW's routing.
+        """
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+            state['step'] += 1
+
+            self._adamw_step_t.fill_(state['step'])
+            self._adamw_lr_t.fill_(group.get('lr', 3e-3))
+            self._adamw_beta1_t.fill_(group.get('betas', (0.9, 0.95))[0])
+            self._adamw_beta2_t.fill_(group.get('betas', (0.9, 0.95))[1])
+            self._adamw_eps_t.fill_(group.get('eps', 1e-8))
+            self._adamw_wd_t.fill_(group.get('weight_decay', 0.0))
+
+            adamw_step_fused(
+                p, grad, exp_avg, exp_avg_sq,
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+
+    def _step_soap(self, group: dict) -> None:
+        """
+        SOAP update adapted from soap.py. Runs in standard eager mode to prevent graph breaks.
+        We use .get() to safely fall back to default hyperparameters if base_train.py didn't set them.
+        """
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+            
+            if "step" not in state:
+                state["step"] = 0 
+                
+            # State initialization
+            if "exp_avg" not in state:
+                state["exp_avg"] = torch.zeros_like(grad)
+                state["exp_avg_sq"] = torch.zeros_like(grad)
+            
+            if 'Q' not in state:
+                # Initialize using inherited SOAP methods
+                self.init_preconditioner(
+                    grad, state,
+                    precondition_frequency=group.get('precondition_frequency', 10),
+                    precondition_1d=group.get('precondition_1d', False),
+                    shampoo_beta=group.get('shampoo_beta', group.get('betas', (0.95, 0.95))[1]),
+                    max_precond_dim=group.get('max_precond_dim', 10000),
+                    merge_dims=group.get("merge_dims", False),
+                )
+                self.update_preconditioner(
+                    grad, state, 
+                    max_precond_dim=group.get('max_precond_dim', 10000),
+                    merge_dims=group.get("merge_dims", False),
+                    precondition_1d=group.get("precondition_1d", False)
+                )
+                continue # SOAP skips the first step to avoid using current gradients in projection
+            
+            # Project gradients to eigenbases
+            grad_projected = self.project(
+                grad, state, 
+                merge_dims=group.get("merge_dims", False), 
+                max_precond_dim=group.get('max_precond_dim', 10000)
+            )
+
+            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+            betas = group.get("betas", (0.95, 0.95))
+            beta1, beta2 = betas[0], betas[1]
+
+            state["step"] += 1
+
+            # Update running averages
+            exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+            exp_avg_sq.mul_(beta2).add_(grad_projected.square(), alpha=(1.0 - beta2))
+
+            eps = group.get("eps", 1e-8)
+            denom = exp_avg_sq.sqrt().add_(eps)
+            
+            # Project EMA of gradients
+            exp_avg_projected = self.project(
+                exp_avg, state, 
+                merge_dims=group.get("merge_dims", False),
+                max_precond_dim=group.get('max_precond_dim', 10000)
+            )
+            
+            step_size = group.get("lr", 3e-3)
+            if group.get("correct_bias", True):
+                bias_correction1 = 1.0 - beta1 ** state["step"]
+                bias_correction2 = 1.0 - beta2 ** state["step"]
+                step_size = step_size * (bias_correction2 ** .5) / bias_correction1
+
+            # Project back to original space
+            norm_grad = self.project_back(
+                exp_avg_projected / denom, state, 
+                merge_dims=group.get("merge_dims", False),
+                max_precond_dim=group.get('max_precond_dim', 10000)
+            )
+
+            if group.get("normalize_grads", False):
+                norm_grad = norm_grad / (1e-30+torch.mean(norm_grad**2)**0.5)
+            
+            # Weight update
+            p.add_(norm_grad, alpha=-step_size)
+            
+            # Weight decay
+            if group.get("weight_decay", 0.0) > 0.0:
+                p.add_(p, alpha=(-group.get("lr", 3e-3) * group["weight_decay"]))
+                
+            # Update preconditioner matrices for the next step
+            self.update_preconditioner(
+                grad, state, 
+                max_precond_dim=group.get('max_precond_dim', 10000),
+                merge_dims=group.get("merge_dims", False),
+                precondition_1d=group.get("precondition_1d", False)
+            )
+
+    @torch.no_grad()
+    def step(self):
+        """
+        The main routing engine. Directs traffic based on the parameter group 'kind'.
+        """
+        for group in self.param_groups:
+            if group['kind'] == 'adamw':
+                self._step_adamw(group)
+            elif group['kind'] == 'soap':
+                self._step_soap(group)
+            elif group['kind'] == 'muon':
+                # Failsafe in case a muon group accidentally gets passed in
+                raise ValueError("SoapAdamW received a 'muon' param group. Check base_train.py routing.")
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
