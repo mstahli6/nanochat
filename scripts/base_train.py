@@ -68,7 +68,7 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
-parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "soap"], help="Which matrix optimizer to use (muon or soap)") #New
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "soap", "kl-shampoo"], help="Which matrix optimizer to use (muon or soap or kl-shampoo)") #New
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -507,6 +507,7 @@ while True:
     # single training step
     # evaluate the gradient
     synchronize()
+    torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
@@ -517,6 +518,10 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    
+    # Capture peak after fwd/bwd passes are complete
+    fwdbwd_peak_mb = torch.cuda.max_memory_allocated() / 1e6
+    
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -539,6 +544,10 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    
+    total_peak_mb = torch.cuda.max_memory_allocated() / 1e6
+    optim_peak_mb = total_peak_mb - fwdbwd_peak_mb
+    
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -577,6 +586,9 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/fwdbwd_peak_mb": fwdbwd_peak_mb, # <--- NEW
+            "train/total_peak_mb": total_peak_mb,   # <--- NEW
+            "train/optim_peak_mb": optim_peak_mb,   # <--- NEW
         }
         wandb_run.log(log_data)
 

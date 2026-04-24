@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from .soap import SOAP
+from .klopt import KLOpt
 
 # -----------------------------------------------------------------------------
 """
@@ -694,5 +695,126 @@ class SoapAdamW(SOAP):
             elif group['kind'] == 'muon':
                 # Failsafe in case a muon group accidentally gets passed in
                 raise ValueError("SoapAdamW received a 'muon' param group. Check base_train.py routing.")
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+            
+    # -----------------------------------------------------------------------------
+# Single GPU version of the KL-Shampoo + AdamW optimizer.
+
+class KLShampooAdamW(KLOpt):
+    """
+    Combined optimizer: KL-Shampoo for 2D matrix params, AdamW for others.
+    Inherits from KLOpt to gain access to the preconditioner helper methods.
+    """
+    def __init__(self, param_groups: list[dict]):
+        # Initialize the base PyTorch Optimizer to manage state
+        torch.optim.Optimizer.__init__(self, param_groups, defaults={})
+        
+        # Explicitly force KL-Shampoo (disable KL-SOAP)
+        self.using_klsoap = False
+        self.cast_dtype = torch.bfloat16
+        self.using_clamping = True
+        self.max_clamp_value = 4000
+        self.init_factor = 0.1
+        self.using_damping = False
+        self.damping = 0.0
+
+        # 0-D CPU tensors for AdamW to avoid torch.compile recompilation
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    def _step_adamw(self, group: dict) -> None:
+        """
+        AdamW update. Exactly identical to MuonAdamW's routing.
+        """
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+            state['step'] += 1
+
+            self._adamw_step_t.fill_(state['step'])
+            self._adamw_lr_t.fill_(group.get('lr', 3e-3))
+            self._adamw_beta1_t.fill_(group.get('betas', (0.9, 0.95))[0])
+            self._adamw_beta2_t.fill_(group.get('betas', (0.9, 0.95))[1])
+            self._adamw_eps_t.fill_(group.get('eps', 1e-8))
+            self._adamw_wd_t.fill_(group.get('weight_decay', 0.0))
+
+            adamw_step_fused(
+                p, grad, exp_avg, exp_avg_sq,
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
+
+    def _step_klshampoo(self, group: dict) -> None:
+        """
+        KL-Shampoo update adapted from KLOpt.step(). 
+        Runs in standard eager mode to prevent graph breaks.
+        """
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            grad = torch.squeeze(p.grad.to(dtype=self.cast_dtype))
+            state = self.state[p]
+            
+            if "step" not in state:
+                state["step"] = 0 
+                
+            # State initialization (Only exp_avg needed for KL-Shampoo)
+            if "exp_avg" not in state:
+                state["exp_avg"] = torch.zeros_like(grad)
+            
+            if 'Q' not in state:
+                # Initialize using inherited KLOpt methods
+                self.init_preconditioner(
+                    grad, state,
+                    precondition_frequency=group.get('precondition_frequency', 10),
+                    shampoo_beta=group.get('shampoo_beta', group.get('betas', (0.95, 0.95))[1])
+                )
+                self.update_preconditioner(grad, state)
+                continue # Skip first step to avoid using current gradients in projection
+            
+            state["step"] += 1
+
+            # Force pure KL-Shampoo update
+            norm_grad = self.klshampoo_update(
+                state, grad, 
+                beta1=group.get('betas', (0.9, 0.95))[0], 
+                damping=group.get('eps', 1e-8)
+            )
+            
+            self.update_preconditioner(grad, state)
+
+            if group.get("normalize_grads", False):
+                norm_grad = norm_grad / (1e-30 + torch.mean(norm_grad**2)**0.5)
+            
+            step_size = group.get("lr", 3e-3)
+            p.add_(norm_grad.view(p.shape), alpha=-step_size)
+            
+            if group.get("weight_decay", 0.0) > 0.0:
+                p.add_(p, alpha=(-step_size * group["weight_decay"]))
+
+    @torch.no_grad()
+    def step(self):
+        """
+        The main routing engine. Directs traffic based on the parameter group 'kind'.
+        """
+        for group in self.param_groups:
+            if group['kind'] == 'adamw':
+                self._step_adamw(group)
+            elif group['kind'] == 'kl-shampoo':
+                self._step_klshampoo(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")

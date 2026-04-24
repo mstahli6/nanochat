@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW, SoapAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW, SoapAdamW, KLShampooAdamW
 
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
@@ -407,6 +407,18 @@ class GPT(nn.Module):
                     precondition_frequency=10,
                     max_precond_dim=10000,
                 ))
+                
+            elif matrix_optim == "kl-shampoo":
+                param_groups.append(dict(
+                    kind='kl-shampoo', params=group_params, lr=matrix_lr,
+                    weight_decay=weight_decay,
+                    precondition_frequency=10,
+                    betas=(0.9, 0.98), # Default KLOpt betas
+                    shampoo_beta=0.95, 
+                    eps=1e-8,
+                    normalize_grads=False
+                ))
+                
             else: # Default to Muon
                 param_groups.append(dict(
                     kind='muon', params=group_params, lr=matrix_lr,
@@ -418,6 +430,14 @@ class GPT(nn.Module):
             if world_size > 1:
                 raise NotImplementedError("Distributed SOAP is not yet implemented. Please use a single GPU.")
             optimizer = SoapAdamW(param_groups)
+        
+        # --- NEW: KL-SHAMPOO INSTANTIATION ---
+        elif matrix_optim == "kl-shampoo":
+            if world_size > 1:
+                raise NotImplementedError("Distributed KL-Shampoo is not yet implemented.")
+            optimizer = KLShampooAdamW(param_groups)
+        # --------------------------------------
+        
         else: # Default to Muon
             Factory = DistMuonAdamW if ddp else MuonAdamW
             optimizer = Factory(param_groups)
