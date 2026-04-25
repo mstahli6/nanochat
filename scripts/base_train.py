@@ -68,7 +68,7 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
-parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "soap", "kl-shampoo"], help="Which matrix optimizer to use (muon or soap or kl-shampoo)") #New
+parser.add_argument("--optimizer", type=str, default="muon", choices=["adamw", "muon", "soap", "kl-shampoo"], help="Which matrix optimizer to use (muon or adamw or soap or kl-shampoo)") #New
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -305,16 +305,32 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    matrix_optim=args.optimizer,  # <--- The new handoff
-)
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer
+if args.optimizer == "adamw":
+    # 1. Pure PyTorch AdamW baseline for all parameters
+    print0("Using pure PyTorch AdamW baseline.")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.matrix_lr * batch_lr_scale, 
+        weight_decay=weight_decay_scaled,
+        betas=(0.9, 0.95),
+        eps=1e-8
+    )
+    # Add metadata expected by the training loop logic
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+        group["kind"] = "adamw" # Prevents errors in the momentum/WD scheduler
+else:
+    # 2. Hybrid advanced optimizers (Muon, SOAP, KL-Shampoo)
+    optimizer = model.setup_optimizer(
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+        matrix_optim=args.optimizer,  
+    )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
