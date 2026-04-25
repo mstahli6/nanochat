@@ -18,6 +18,9 @@ import json
 import time
 import math
 import argparse
+import csv
+import random
+import numpy as np
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -36,6 +39,13 @@ from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
@@ -43,6 +53,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="random seed for deterministic training")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -70,12 +81,12 @@ parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR 
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 parser.add_argument("--optimizer", type=str, default="muon", choices=["adamw", "muon", "soap", "kl-shampoo"], help="Which matrix optimizer to use (muon or adamw or soap or kl-shampoo)") #New
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-every", type=int, default=2000, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -83,6 +94,7 @@ user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
+set_seed(args.seed)
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
@@ -156,6 +168,22 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+
+# -----------------------------------------------------------------------------
+# Setup Local CSV Logging
+metrics_file = None
+metrics_writer = None
+if master_process:
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    csv_path = os.path.join(checkpoint_dir, "metrics_log.csv")
+    metrics_file = open(csv_path, "a", newline="")
+    metrics_writer = csv.writer(metrics_file)
+    if not resuming:
+        metrics_writer.writerow([
+            "step", "train_loss", "lrm", "dt_ms", "tok_per_sec", "mfu", 
+            "fwdbwd_peak_mb", "optim_peak_mb", "total_peak_mb", "optim_time_ms", "grad_norm"
+        ])
+
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -172,7 +200,6 @@ if args.fp8:
     else:
         # our custom fp8 is simpler than torchao, written for exact API compatibility
         from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
         # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
@@ -287,18 +314,10 @@ if total_batch_size == -1:
 batch_lr_scale = 1.0
 batch_ratio = total_batch_size / B_REF # B/B_ref
 if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
 
 # 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
-# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
-# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
-# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
-# λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
@@ -306,7 +325,6 @@ if weight_decay_scaled != args.weight_decay:
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer
 if args.optimizer == "adamw":
     # 1. Pure PyTorch AdamW baseline for all parameters
     print0("Using pure PyTorch AdamW baseline.")
@@ -355,15 +373,12 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
 elif args.target_flops > 0:
-    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
     num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif args.target_param_data_ratio > 0:
-    # Calculate the number of iterations from the target param data ratio (the most common use case)
     num_iterations = target_tokens // total_batch_size
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
@@ -453,8 +468,6 @@ while True:
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
@@ -470,7 +483,6 @@ while True:
         model.train()
 
     # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
@@ -515,7 +527,7 @@ while True:
             rank=ddp_rank,
         )
 
-    # termination conditions (TODO: possibly also add loss explosions etc.)
+    # termination conditions
     if last_step:
         break
 
@@ -538,6 +550,17 @@ while True:
     # Capture peak after fwd/bwd passes are complete
     fwdbwd_peak_mb = torch.cuda.max_memory_allocated() / 1e6
     
+    # Unscale gradients for accurate norm calculation (if using fp16)
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+
+    # Calculate global gradient norm (max_norm=1.0 will also clip them to stabilize training)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf')).item()
+
+    # Reset memory stats to strictly isolate optimizer step memory
+    torch.cuda.reset_peak_memory_stats()
+    t_optim_start = time.time()
+
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -547,11 +570,9 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    
     if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        # Note: We already unscaled gradients above for the grad_norm calculation
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
@@ -559,10 +580,13 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+        
     model.zero_grad(set_to_none=True)
     
-    total_peak_mb = torch.cuda.max_memory_allocated() / 1e6
-    optim_peak_mb = total_peak_mb - fwdbwd_peak_mb
+    t_optim_end = time.time()
+    optim_time_ms = (t_optim_end - t_optim_start) * 1000
+    optim_peak_mb = torch.cuda.max_memory_allocated() / 1e6
+    total_peak_mb = max(fwdbwd_peak_mb, optim_peak_mb)
     
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -591,7 +615,11 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    
+    # Warmup profiling: log every step for first 100, then switch to every 200
+    is_log_step = (step < 100) or (step % 200 == 0)
+    
+    if is_log_step:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -602,25 +630,33 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
-            "train/fwdbwd_peak_mb": fwdbwd_peak_mb, # <--- NEW
-            "train/total_peak_mb": total_peak_mb,   # <--- NEW
-            "train/optim_peak_mb": optim_peak_mb,   # <--- NEW
+            "train/fwdbwd_peak_mb": fwdbwd_peak_mb,
+            "train/optim_peak_mb": optim_peak_mb,
+            "train/total_peak_mb": total_peak_mb,
+            "train/optim_time_ms": optim_time_ms,
+            "train/grad_norm": grad_norm,
         }
         wandb_run.log(log_data)
+        
+        # Write directly to the local CSV to prevent WandB bottleneck data loss
+        if master_process and metrics_writer is not None:
+            metrics_writer.writerow([
+                step, debiased_smooth_loss, lrm, dt * 1000, tok_per_sec, mfu, 
+                fwdbwd_peak_mb, optim_peak_mb, total_peak_mb, optim_time_ms, grad_norm
+            ])
+            metrics_file.flush() # Force write to disk immediately
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
 
-    # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
-    # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
-    # So we manually manage and help it out here
+    # Garbage collector logic
     if first_step_of_run:
-        gc.collect() # manually collect a lot of garbage from setup
-        gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
-        gc.disable() # nuclear intervention here: disable GC entirely except:
-    elif step % 5000 == 0: # every 5000 steps...
-        gc.collect() # manually collect, just to be safe for very, very long runs
+        gc.collect() 
+        gc.freeze() 
+        gc.disable() 
+    elif step % 5000 == 0:
+        gc.collect() 
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -655,5 +691,7 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
-wandb_run.finish() # wandb run finish
+wandb_run.finish()
+if master_process and metrics_file is not None:
+    metrics_file.close()
 compute_cleanup()

@@ -701,6 +701,7 @@ class SoapAdamW(SOAP):
     # -----------------------------------------------------------------------------
 # Single GPU version of the KL-Shampoo + AdamW optimizer.
 
+
 class KLShampooAdamW(KLOpt):
     """
     Combined optimizer: KL-Shampoo for 2D matrix params, AdamW for others.
@@ -716,8 +717,8 @@ class KLShampooAdamW(KLOpt):
         self.using_clamping = True
         self.max_clamp_value = 4000
         self.init_factor = 0.1
-        self.using_damping = False
-        self.damping = 0.0
+        self.using_damping = True     # <--- CHANGED: Enabled damping
+        self.damping = 1e-4           # <--- CHANGED: Set proper second-order damping baseline
 
         # 0-D CPU tensors for AdamW to avoid torch.compile recompilation
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -792,7 +793,7 @@ class KLShampooAdamW(KLOpt):
             norm_grad = self.klshampoo_update(
                 state, grad, 
                 beta1=group.get('betas', (0.9, 0.95))[0], 
-                damping=group.get('eps', 1e-8)
+                damping=1e-4  # <--- CHANGED: Decoupled from AdamW's 1e-8 eps to prevent explosion
             )
             
             self.update_preconditioner(grad, state)
