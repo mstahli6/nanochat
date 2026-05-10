@@ -1,3 +1,32 @@
+# Final Project: What Adam is Missing: Personal Hygiene and Subatomic Particles
+
+**Author:** Michel Stahli  
+**Date:** April 2026  
+
+## 🚀 Reproducing the Experiment
+
+To reproduce the 12-layer, 1xA6000 GPT-2 pre-training runs described in the report:
+
+1. **Setup:** Follow the installation and environment setup instructions in `runs/runcpu.sh` (stop right before it calls `base_train.py`).
+2. **Execution:** The main training script is located at `scripts/base_train.py`. You can execute it using the arguments provided in `run_testnvd.sh` (located in the root directory). 
+3. **SLURM:** Alternatively, if using a SLURM cluster, you can use the provided SLURM script which was used to run all four optimizers separately using `base_train.py`.
+
+## 📊 Analysis and Figures
+
+* The code used to generate the figures and analyze the results is located in `Analysis/analysis_nb.ipynb`. 
+* *(Note: The raw training logs are not saved in this repository due to size constraints).*
+
+## 🛠️ Modifications to Original Nanochat
+
+This repository is a fork of Andrej Karpathy's `nanochat`. To implement the optimizer comparisons, the following key modifications were made:
+
+* **`nanochat/optim.py`**: Added custom implementations for the SOAP and KL-Shampoo optimizers.
+* **`scripts/base_train.py` & Configs**: Adjusted model depth from 24 to 12, reduced `max-seq-len` to 512, and increased `device-batch-size` to 32 to accommodate the 1xA6000 hardware constraints.
+* **`requirements.txt`**: Added necessary dependencies required for the custom optimizers.
+
+---
+
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
