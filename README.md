@@ -9,7 +9,7 @@ To reproduce the 12-layer, 1xA6000 GPT-2 pre-training runs described in the repo
 
 1. **Setup:** Follow the installation and environment setup instructions in `runs/runcpu.sh` (stop right before it calls `base_train.py`).
 2. **Execution:** The main training script is located at `scripts/base_train.py`. You can execute it using the arguments provided in `run_testnvd.sh` (located in the root directory). 
-3. **SLURM:** Alternatively, if using a SLURM cluster, you can use the provided SLURM script which was used to run all four optimizers separately using `base_train.py`.
+3. **SLURM:** Alternatively, if using a SLURM cluster, you can use the provided SLURM script (`run_testnvd.sh`) which was used to run all four optimizers separately using `base_train.py`.
 
 ## 📊 Analysis and Figures
 
