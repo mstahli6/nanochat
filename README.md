@@ -22,7 +22,6 @@ This repository is a fork of Andrej Karpathy's `nanochat`. To implement the opti
 
 * **`nanochat/optim.py`**: Added custom implementations for the SOAP and KL-Shampoo optimizers.
 * **`scripts/base_train.py` & Configs**: Adjusted model depth from 24 to 12, reduced `max-seq-len` to 512, and increased `device-batch-size` to 32 to accommodate the 1xA6000 hardware constraints.
-* **`requirements.txt`**: Added necessary dependencies required for the custom optimizers.
 
 ---
 
